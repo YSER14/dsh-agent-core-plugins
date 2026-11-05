@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Directory Tools (agent-core style)",
+    "description": "Scans configured directories for .mjs tool files and registers each as a model tool, executed in an isolated subprocess with timeout and output caps."
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "agent-core Compaction Refinements",
+    "description": "Promotes the latest compaction summary into the system prompt, and optionally swaps in an instruction-enhanced compaction engine."
+  }
+}

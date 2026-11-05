@@ -1,0 +1,23 @@
+# @local/dsh-ac-tools bundle layer: inserts one Host plugin. The tools directory itself is configured
+# on the row (config.dirs) so the Loader stays the single source of what is mounted.
+- insert:
+    - id: dsh-ac-tools
+      name: '@local/dsh-ac-tools'
+      config:
+        # Tool directories to scan. Relative entries resolve against this package
+        # directory (so "./demo-tools" works after a plain checkout); absolute
+        # paths are used verbatim. Each .mjs file with a default export shaped
+        # { name, description, inputSchema, execute } becomes one model-facing tool.
+        dirs: ["./demo-tools"]
+        # Prefix for every registered tool name; guarantees no collision with
+        # built-in tool names (fs, shell, grep, todo, ...).
+        namespace: 'ac'
+        # Per-call timeout in milliseconds; the tool subprocess is killed when it elapses.
+        timeoutMs: 60000
+        # Maximum characters of a tool result handed back to the model.
+        maxOutputChars: 20000
+        # Maximum characters of streamed stdout kept for error reports.
+        maxLogChars: 8000
+        # Extra extensions accepted besides .mjs. Only JavaScript modules are supported.
+        # Watch tool directories and re-register on changes (hot reload).
+        watch: true

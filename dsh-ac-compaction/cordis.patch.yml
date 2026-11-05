@@ -1,0 +1,22 @@
+# @local/dsh-ac-compaction bundle layer.
+#
+# Row 1 (dsh-ac-compaction-system): per-agent system-prompt promotion of the
+# latest compaction summary. Zero engine changes; safe with the stock basic.
+#
+# Row 2 (engine override): swaps the shipped compaction-basic row for the
+# instruction-enhanced engine. `id: compaction-basic` targets the shipped
+# base row; the name swap makes the Loader load our AcCompactionEngine as
+# ctx.compaction instead. Pruner and /compact follow the service, so they
+# keep working. Remove this patch block (or the whole bundle) to revert.
+- insert:
+    - id: dsh-ac-compaction-system
+      name: '@local/dsh-ac-compaction'
+    - id: dsh-ac-compaction-nudge
+      name: '@local/dsh-ac-compaction/nudge'
+      config:
+        # Nudge when the model has produced this many consecutive tool-less steps
+        afterSteps: 1
+        # Go quiet after this many consecutive nudges (anti-runaway spend)
+        maxNudges: 2
+- id: include:compaction-basic
+  name: '@local/dsh-ac-compaction/engine'

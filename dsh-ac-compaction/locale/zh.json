@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "agent-core 式压缩增强",
+    "description": "把最新压缩总结升格进 system 提示词；可选启用指令增强版压缩引擎。"
+  }
+}

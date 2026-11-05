@@ -1,0 +1,16 @@
+{
+  "name": "@local/dsh-ac-tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "agent-core-style directory tools for the DeepSeek Harness: drop a .mjs file into a tools directory and the model gains one tool, executed in an isolated subprocess.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["index.js", "runner.mjs", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" }
+  }
+}
