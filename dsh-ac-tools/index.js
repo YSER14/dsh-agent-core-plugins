@@ -122,19 +122,29 @@ async function runRunner(subprocess, request, options) {
 }
 
 /** Map the runner's per-file metadata into registered tools, applying namespace and collision policy. */
-function buildDefinitions(ctx, config, metas) {
+function buildDefinitions(ctx, config, metas, log) {
   const prefix = `${config.namespace}_`
   const definitions = []
   const rejected = []
+  const claimed = new Set() // names taken in THIS batch (fixes #5: get() only sees committed tools)
 
   for (const meta of metas) {
     if (meta.error) { rejected.push({ source: meta.url, reason: `load failed: ${meta.error}` }); continue }
+    if (typeof meta.name !== 'string' || meta.name.trim().length === 0) {
+      rejected.push({ source: meta.url, reason: `invalid tool name ${JSON.stringify(meta.name)}` })
+      continue
+    }
     const toolName = `${prefix}${meta.name}`
+    if (claimed.has(toolName)) {
+      rejected.push({ source: meta.url, reason: `duplicate name in this batch: ${toolName}` })
+      continue
+    }
     if (ctx.tools.get(toolName) !== undefined) {
       // Collision policy: refuse loudly, never override an existing tool.
       rejected.push({ source: meta.url, reason: `name collision: ${toolName} is already registered` })
       continue
     }
+    claimed.add(toolName)
     definitions.push({
       url: meta.url,
       toolName,
@@ -147,13 +157,12 @@ function buildDefinitions(ctx, config, metas) {
           render: (_args, value) => [{ type: 'text', text: String(value ?? '') }],
         },
         async execute(args, exec) {
-          const started = Date.now()
           const request = { mode: 'call', url: meta.url, name: meta.name, input: args ?? {}, toolCallId: exec?.toolCallId }
-          const signal = AbortSignal.any([exec?.signal ?? AbortSignal.signal('never'), AbortSignal.timeout(config.timeoutMs)])
-          const handle = subprocessCall(ctx, config, request, signal)
-          const result = await handle
-          const output = truncateOutput(config, result.output)
-          return renderOutput(output, Date.now() - started)
+          // fixes #2: AbortSignal.signal() does not exist — compose what exists.
+          const timeout = AbortSignal.timeout(config.timeoutMs)
+          const signal = exec?.signal ? AbortSignal.any([exec.signal, timeout]) : timeout
+          const result = await subprocessCall(ctx, config, request, signal, log)
+          return renderOutput(truncateOutput(config, result.output))
         },
       },
     })
@@ -162,7 +171,7 @@ function buildDefinitions(ctx, config, metas) {
 }
 
 /** One execute() call; split from buildDefinitions so the abort signal can be threaded cleanly. */
-function subprocessCall(ctx, config, request, signal) {
+function subprocessCall(ctx, config, request, signal, log) {
   const argv = [nodeExecutable, RUNNER_PATH]
   const handle = ctx.subprocess.spawn({
     argv,
@@ -190,11 +199,21 @@ function subprocessCall(ctx, config, request, signal) {
       throw new Error(stderrText.trim() || `工具子进程退出码 ${exit.exitCode}`)
     }
     const lines = stdoutText.split('\n').filter(line => line.trim().length > 0)
+    // fixes #3: the child's '#' progress lines were silently dropped — relay them to the log.
+    for (const line of lines) {
+      if (!line.startsWith('#')) continue
+      try {
+        const progress = JSON.parse(line.slice(1))
+        log?.info?.(`[${request.name}] ${progress.stream}: ${progress.data}`)
+      } catch { /* malformed progress line: ignore */ }
+    }
     const finalLine = [...lines].reverse().find(line => !line.startsWith('#'))
     if (!finalLine) throw new Error(`工具没有返回结果；stderr: ${stderrText.slice(0, 400)}`)
     let parsed
     try { parsed = JSON.parse(finalLine) } catch { throw new Error(`工具返回值不是合法 JSON：${finalLine.slice(0, 200)}`) }
     if (!parsed.ok) throw new Error(parsed.error ?? '工具执行失败')
+    // fixes #10: an error-text block is a failure, not a successful string result.
+    if (parsed.output?.type === 'error-text') throw new Error(String(parsed.output.value ?? '工具返回错误'))
     return parsed
   })()
 }
@@ -213,9 +232,8 @@ function truncateOutput(config, output) {
 }
 
 /** Final tool result handed to the session. */
-function renderOutput(output, ms) {
-  const text = output?.type === 'text' ? output.value : JSON.stringify(output?.value)
-  return text
+function renderOutput(output) {
+  return output?.type === 'text' ? output.value : JSON.stringify(output?.value)
 }
 
 export const inject = ['fs', 'subprocess', 'tools']
@@ -234,67 +252,97 @@ export function apply(ctx, config) {
   if (!subprocess) fail('ctx.subprocess is unavailable; the subprocess service must be mounted')
 
   const disposers = []
-  const registered = () => disposers.length
+  const unwatchers = []
+  let disposed = false
+  let syncing = false
+  let pending = false
 
   /** Unregister everything this plugin added. Idempotent. */
   const unregisterAll = async () => {
-    const pending = disposers.splice(0)
-    for (const dispose of pending) await Promise.resolve(dispose()).catch(() => {})
-    return pending.length
+    const queued = disposers.splice(0)
+    for (const dispose of queued) await Promise.resolve(dispose()).catch(() => {})
+    return queued.length
   }
 
   /** Full scan + register cycle; returns how many tools this pass produced. */
   const syncOnce = async () => {
     await unregisterAll() // a reload always starts from zero so removed files lose their tools too
+    if (disposed) return 0 // fixes #6: never register after the plugin was disposed
     const files = await collectToolFiles(fs, resolved.dirs, log)
+    if (disposed) return 0
     const urls = files.map(file => pathToFileURL(file).href)
     if (!urls.length) {
       log.info('no tool files found in', resolved.dirs)
       return 0
     }
     const described = await runRunner(subprocess, { mode: 'describe', urls }, resolved)
+    if (disposed) return 0
     if (!described.ok) fail(`describe failed: ${described.error}`)
-    const { definitions, rejected } = buildDefinitions(ctx, resolved, described.tools)
+    const { definitions, rejected } = buildDefinitions(ctx, resolved, described.tools, log)
     for (const { source, reason } of rejected) log.warn(`skipped ${source}: ${reason}`)
-    for (const { definition } of definitions) {
-      // tools.register returns its own disposer; keep it so hot reload and
-      // plugin disposal unregister exactly what we added, nothing else.
-      disposers.push(ctx.tools.register(definition))
+    if (disposed) return 0
+    // fixes #5: register as a transaction — a failure mid-pass must not leave a half set.
+    const added = []
+    try {
+      for (const { definition } of definitions) added.push(ctx.tools.register(definition))
+    } catch (error) {
+      for (const dispose of added) await Promise.resolve(dispose()).catch(() => {})
+      throw error
     }
+    disposers.push(...added)
     log.info(`registered ${definitions.length} tool(s) from ${resolved.dirs.length} dir(s)`)
     return definitions.length
   }
 
+  /**
+   * Single-flight sync (fixes #2): concurrent directory events share one pass and
+   * a change that arrives mid-pass queues exactly one re-run, so the last save is
+   * never dropped and two passes never unregister each other's tools.
+   */
+  const requestSync = async () => {
+    if (disposed) return 0
+    if (syncing) { pending = true; return 0 }
+    syncing = true
+    try {
+      let count = 0
+      do {
+        pending = false
+        count = await syncOnce()
+      } while (pending && !disposed)
+      return count
+    } finally {
+      syncing = false
+    }
+  }
+
   // Initial scan runs async (it spawns the runner); failures are visible in logs
   // but never abort plugin activation with a half-registered tool set.
-  void syncOnce().catch(error => log.error('initial scan failed:', error?.message ?? error))
+  void requestSync().catch(error => log.error('initial scan failed:', error?.message ?? error))
 
-  // Hot reload: watch each configured directory; on change, unregister ours and re-register.
+  // Hot reload: watch each configured directory; on change, re-scan.
   if (resolved.watch) {
     void (async () => {
-      const stopFns = []
       for (const dir of resolved.dirs) {
+        if (disposed) return
         try {
           const target = await fs.resolve(dir)
-          let reloading = false
-          const stop = await fs.watch(target, async () => {
-            if (reloading) return
-            reloading = true
-            try {
-              await syncOnce()
-            } catch (error) {
-              log.error('hot reload failed:', error?.message ?? error)
-            } finally { reloading = false }
+          if (disposed) return
+          const stop = await fs.watch(target, () => {
+            void requestSync().catch(error => log.error('hot reload failed:', error?.message ?? error))
           }, ctx.signal ?? undefined)
-          stopFns.push(stop)
+          // fixes #2: keep the stop function so disposal actually stops the watcher.
+          unwatchers.push(stop)
         } catch (error) {
           log.warn(`watch unavailable for ${dir}: ${error?.message ?? error}`)
         }
       }
-      return async () => { for (const stop of stopFns) await Promise.resolve(stop()).catch(() => {}) }
     })().catch(error => log.error('watch setup failed:', error?.message ?? error))
   }
 
-  // Cleanup path: when the plugin is disabled, its effect disposers run; ours unregisters every tool.
-  ctx.effect(() => async () => { await unregisterAll() })
+  // Cleanup path: mark disposed first, then stop watchers and unregister every tool.
+  ctx.effect(() => async () => {
+    disposed = true
+    for (const stop of unwatchers.splice(0)) await Promise.resolve(stop()).catch(() => {})
+    await unregisterAll()
+  })
 }

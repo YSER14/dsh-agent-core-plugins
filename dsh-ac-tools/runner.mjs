@@ -44,13 +44,34 @@ function shape(result) {
   return { type: 'json', value }
 }
 
-/** Drain generator/async-generator returns: each chunk is streamed, all chunks become the value. */
+/** A tool name must be a non-empty string; describe and call share this rule (fixes #9). */
+function validName(value) {
+  return typeof value === 'string' && value.trim().length > 0 && value === value.trim()
+}
+
+/**
+ * Drain generator/async-generator returns: each yielded chunk is streamed as
+ * progress, the generator's `return` value is the tool result when present
+ * (fixes #8 — `for await` would silently drop it).
+ */
 async function collect(result) {
-  if (!result || typeof result.next !== 'function' ||
-      (typeof result[Symbol.asyncIterator] !== 'function' && typeof result[Symbol.iterator] !== 'function')) return result
+  const isIterator = result && typeof result.next === 'function' &&
+    (typeof result[Symbol.asyncIterator] === 'function' || typeof result[Symbol.iterator] === 'function')
+  if (!isIterator) return result
+  const iterator = typeof result[Symbol.asyncIterator] === 'function'
+    ? result[Symbol.asyncIterator]()
+    : result[Symbol.iterator]()
   const chunks = []
-  for await (const chunk of result) { chunks.push(chunk); report('result', chunk) }
-  return chunks
+  for (;;) {
+    const step = await iterator.next()
+    if (step.done) {
+      if (step.value !== undefined) return step.value
+      if (chunks.length === 0) return undefined
+      return chunks.length === 1 ? chunks[0] : chunks
+    }
+    chunks.push(step.value)
+    report('result', step.value)
+  }
 }
 
 async function readStdin() {
@@ -70,10 +91,14 @@ async function main() {
       try {
         const module = await import(url)
         for (const tool of [module.default].flat()) {
-          if (!tool?.name || typeof tool.execute !== 'function') continue
+          if (!tool || typeof tool.execute !== 'function') continue
+          if (!validName(tool.name)) {
+            tools.push({ url, error: `invalid tool name ${JSON.stringify(tool.name)}: a non-empty string is required` })
+            continue
+          }
           tools.push({
             url,
-            name: String(tool.name),
+            name: tool.name,
             description: typeof tool.description === 'string' ? tool.description : '',
             inputSchema: tool.inputSchema && typeof tool.inputSchema === 'object' ? tool.inputSchema : { type: 'object', properties: {} },
           })
@@ -88,9 +113,10 @@ async function main() {
 
   if (request.mode === 'call') {
     try {
+      if (!validName(request.name)) throw new Error(`invalid tool name ${JSON.stringify(request.name)}: a non-empty string is required`)
       const module = await import(request.url)
-      const tool = [module.default].flat().find(one => one?.name === request.name)
-      if (!tool || typeof tool.execute !== 'function') throw new Error(`tool ${request.name} not found in ${request.url}`)
+      const tool = [module.default].flat().find(one => one && typeof one.execute === 'function' && one.name === request.name)
+      if (!tool) throw new Error(`tool ${request.name} not found in ${request.url}`)
       const raw = await tool.execute(request.input, { signal: undefined, toolCallId: request.toolCallId })
       const value = await collect(raw)
       const output = shape(tool.toModelOutput ? await tool.toModelOutput({ output: value, input: request.input, toolCallId: request.toolCallId }) : value)

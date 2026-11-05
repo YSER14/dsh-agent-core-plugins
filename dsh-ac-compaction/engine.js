@@ -88,10 +88,9 @@ export class AcCompactionEngine extends BasicCompactionEngine {
    */
   async summarize(input, agent, signal) {
     const config = this.config
-    const latest = agent.session.requestHeader()?.config
     const configured = config.summarizationProvider.length === 0 ? undefined : { provider: config.summarizationProvider, model: config.summarizationModel }
-    const agentTarget = agent.options.provider?.length > 0 && agent.options.model?.length > 0 ? { provider: agent.options.provider, model: agent.options.model } : undefined
-    const target = configured ?? latest ?? agentTarget
+    // fixes #3: reuse the shared resolver instead of duplicating its precedence.
+    const target = configured ?? conversationTarget(agent)
     if (target === undefined) throw new Error('no provider/model available for summarization: set both summarization fields, route one request, or set both AgentOptions fields')
 
     const assembler = new BlockAssembler()
